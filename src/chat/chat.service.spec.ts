@@ -11,6 +11,7 @@ jest.mock('@langchain/groq', () => {
     ChatGroq: jest.fn().mockImplementation(() => {
       return {
         invoke: mockInvoke,
+        bindTools: jest.fn().mockReturnThis(),
       };
     }),
   };
@@ -26,7 +27,7 @@ describe('ChatService', () => {
     mockInvoke.mockReset();
     mockInvoke.mockResolvedValue(new AIMessage('Hello from Groq!'));
     mockedAxios.get.mockReset();
-    mockedAxios.get.mockResolvedValue({ data: 'Mocked search response' });
+    mockedAxios.get.mockResolvedValue({ data: [{ username: 'test', email: 'test@test.com' }] });
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -51,6 +52,22 @@ describe('ChatService', () => {
   });
 
   it('calls search API and returns an assistant message', async () => {
+    mockInvoke
+      .mockResolvedValueOnce(
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              name: 'user_search',
+              args: { query: 'Search query' },
+              id: 'call_1',
+              type: 'tool_call',
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(new AIMessage('Hello from Groq!'));
+
     const result = await service.chat({
       messages: [{ role: 'user', content: 'Search query' }],
     });
@@ -58,7 +75,7 @@ describe('ChatService', () => {
     expect(mockedAxios.get).toHaveBeenCalledWith(
       'http://localhost:3001/users/search?q=Search%20query',
     );
-    expect(mockInvoke).toHaveBeenCalledTimes(1);
+    expect(mockInvoke).toHaveBeenCalledTimes(2);
     expect(result).toEqual({
       model: 'llama-3.1-8b-instant',
       message: {
@@ -71,7 +88,21 @@ describe('ChatService', () => {
 
   it('returns "no user with this username" when API response is empty', async () => {
     mockedAxios.get.mockResolvedValue({ data: [] });
-    mockInvoke.mockResolvedValue(new AIMessage('no user with this username'));
+    mockInvoke
+      .mockResolvedValueOnce(
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              name: 'user_search',
+              args: { query: 'NonExistentUser' },
+              id: 'call_1',
+              type: 'tool_call',
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(new AIMessage('no user with this username'));
 
     const result = await service.chat({
       messages: [{ role: 'user', content: 'NonExistentUser' }],
@@ -80,7 +111,7 @@ describe('ChatService', () => {
     expect(mockedAxios.get).toHaveBeenCalledWith(
       'http://localhost:3001/users/search?q=NonExistentUser',
     );
-    expect(mockInvoke).toHaveBeenCalledTimes(1);
+    expect(mockInvoke).toHaveBeenCalledTimes(2);
     expect(result.message.content).toBe('no user with this username');
   });
 
@@ -91,10 +122,17 @@ describe('ChatService', () => {
 
     expect(mockInvoke).toHaveBeenCalledTimes(1);
     const invokedMessages = mockInvoke.mock.calls[0][0];
-    const systemMessage = invokedMessages.find((msg: any) => msg.constructor.name === 'SystemMessage');
+    const systemMessage = invokedMessages.find(
+      (msg: any) => msg.constructor.name === 'SystemMessage',
+    );
 
     expect(systemMessage).toBeDefined();
-    expect(systemMessage.content).toContain('You must respond ONLY using the information provided in the "User Search Results" below.');
-    expect(systemMessage.content).toContain('Do NOT use any of your pre-trained model knowledge');
+    expect(systemMessage.content).toContain(
+      'Base your answers ONLY on data from tool results.',
+    );
+    expect(systemMessage.content).toContain(
+      'Never use your pre-trained knowledge to answer questions about users.',
+    );
   });
 });
+

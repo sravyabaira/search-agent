@@ -3,6 +3,7 @@ import {
   HumanMessage,
   SystemMessage,
   BaseMessage,
+  ToolMessage,
 } from '@langchain/core/messages';
 import { ChatGroq } from '@langchain/groq';
 import { Injectable } from '@nestjs/common';
@@ -11,15 +12,48 @@ import axios from 'axios';
 import { ChatMessageDto } from './dto/chat-message.dto';
 import { ChatRequestDto } from './dto/chat-request.dto';
 import { Annotation, END, START, StateGraph } from '@langchain/langgraph';
+import { ToolNode } from '@langchain/langgraph/prebuilt';
+import { tool } from '@langchain/core/tools';
+import { z } from 'zod';
+
+const userSearchTool = tool(
+  async ({ query }) => {
+    try {
+      const apiResponse = await axios.get(
+        `http://localhost:3001/users/search?q=${encodeURIComponent(query)}`,
+      );
+      const data = apiResponse.data;
+
+      // Check for genuinely empty responses
+      const isEmpty =
+        data === null ||
+        data === undefined ||
+        (Array.isArray(data) && data.length === 0) ||
+        (typeof data === 'string' && data.trim() === '');
+
+      if (isEmpty) {
+        return `SEARCH_RESULT for "${query}": NO_USERS_FOUND. No user exists with this username or matching this query.`;
+      }
+
+      const formattedData = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+      return `SEARCH_RESULT for "${query}": USERS_FOUND. Data:\n${formattedData}`;
+    } catch (error) {
+      return `Error fetching user search data: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  },
+  {
+    name: 'user_search',
+    description: 'Search for users by username or search query to find their details like profiles, names, pets, etc.',
+    schema: z.object({
+      query: z.string().describe('The username or search query to find user details.'),
+    }),
+  }
+);
 
 const GraphState = Annotation.Root({
   messages: Annotation<BaseMessage[]>({
     reducer: (x, y) => x.concat(y),
     default: () => [],
-  }),
-  searchResults: Annotation<string>({
-    reducer: (x, y) => y ?? x,
-    default: () => '',
   }),
   model: Annotation<string>({
     reducer: (x, y) => y ?? x,
@@ -35,66 +69,57 @@ export class ChatService {
 
   constructor(private readonly configService: ConfigService) {
     this.defaultModel =
-      this.configService.get<string>('GROQ_MODEL') ?? 'llama-3.1-8b-instant';
+      this.configService.get<string>('GROQ_MODEL') ?? 'llama-3.3-70b-versatile';
     this.app = this.initializeGraph();
   }
 
   private initializeGraph() {
-    const workflow = new StateGraph(GraphState)
-      .addNode('search', async (state) => {
-        const lastMessage = state.messages.at(-1)?.content || '';
-        const searchInput = typeof lastMessage === 'string' ? lastMessage : JSON.stringify(lastMessage);
+    const toolNode = new ToolNode([userSearchTool]);
 
-        let searchResults = '';
-        try {
-          const apiResponse = await axios.get(
-            `http://localhost:3001/users/search?q=${encodeURIComponent(searchInput)}`,
-          );
-          const data = apiResponse.data;
-          if (
-            !data ||
-            (Array.isArray(data) && data.length === 0) ||
-            (typeof data === 'object' && Object.keys(data).length === 0) ||
-            (typeof data === 'string' && data.trim() === '')
-          ) {
-            searchResults = 'No user with this username';
-          } else {
-            searchResults =
-              typeof data === 'string' ? data : JSON.stringify(data, null, 2);
-          }
-        } catch (error) {
-          searchResults = `Error fetching user search data: ${error instanceof Error ? error.message : String(error)}`;
-        }
-        return { searchResults };
-      })
-      .addNode('llm', async (state) => {
+    const shouldContinue = (state: typeof GraphState.State) => {
+      const lastMessage = state.messages.at(-1);
+      if (
+        lastMessage &&
+        'tool_calls' in lastMessage &&
+        Array.isArray(lastMessage.tool_calls) &&
+        lastMessage.tool_calls.length > 0
+      ) {
+        return 'tools';
+      }
+      return END;
+    };
+
+    const workflow = new StateGraph(GraphState)
+      .addNode('agent', async (state) => {
         const llm = this.createModel(state.model || this.defaultModel);
-        const messages = [
-          new SystemMessage(
-            `You are a helpful assistant.
-            CRITICAL INSTRUCTIONS:
-            - If User Search Results is an empty array ([]), "No user with this username", or contains no matching users, respond exactly:
-              no user with this username
-            - You must respond ONLY using the information provided in the "User Search Results" below.
-            - Do NOT use any of your pre-trained model knowledge, outside knowledge, or general knowledge to answer.
-            - If the "User Search Results" do not contain the answer, or if the user's request is unrelated to the search results, respond exactly:
-              "I cannot answer this question as the required information is not present in the search results."
-            - Return EVERY user object.
-            - Return EVERY pet object.
-            - Return EVERY field exactly as provided.
-            - Use ONLY the data provided.
-            - Never create sample users.
-            - Never invent data.
-          User Search Results:${state.searchResults}`,
-          ),
-          ...state.messages,
-        ];
-        const response = await llm.invoke(messages);
+        const lastMessage = state.messages.at(-1);
+        const hasToolMessage = lastMessage instanceof ToolMessage;
+        const llmWithTools = hasToolMessage ? llm : llm.bindTools([userSearchTool]);
+
+        const systemPrompt = `You are a helpful assistant that searches for user information.
+
+          When the user asks about a person, pet, or anything that requires looking up user data:
+          1. First check the conversation history for previous tool results that already contain the answer. If found, reuse that data without calling the tool again.
+          2. If the information is NOT already in the history, call the user_search tool.
+
+          How to interpret tool results:
+          - If the result contains "USERS_FOUND", the search was successful. Present ALL the user data returned — every field, every user object, every pet object — exactly as provided.
+          - If the result contains "NO_USERS_FOUND", respond with exactly: "no user with this username"
+
+          Strict rules:
+          - Base your answers ONLY on data from tool results. Never invent, fabricate, or assume any user data.
+          - Never use your pre-trained knowledge to answer questions about users.
+          - If the user asks something unrelated to user searches, or the tool results don't contain the answer, respond with: "I cannot answer this question as the required information is not present in the search results."
+          - Present all data exactly as returned — do not omit fields, users, or pets.`;
+
+        const messages = [new SystemMessage(systemPrompt), ...state.messages];
+        const response = await llmWithTools.invoke(messages);
         return { messages: [response] };
       })
-      .addEdge(START, 'search')
-      .addEdge('search', 'llm')
-      .addEdge('llm', END);
+      .addNode('tools', toolNode)
+      .addEdge(START, 'agent')
+      .addConditionalEdges('agent', shouldContinue)
+      .addEdge('tools', 'agent');
 
     return workflow.compile();
   }
@@ -133,9 +158,8 @@ export class ChatService {
 
     const responseMessage = resultState.messages.at(-1) as AIMessage;
 
-    history.push(...newMessages, responseMessage);
-    this.histories.set('default', history);
-
+    const newlyAddedMessages = resultState.messages.slice(history.length);
+    this.histories.set('default', [...history, ...newlyAddedMessages]);
     return {
       model,
       message: {
