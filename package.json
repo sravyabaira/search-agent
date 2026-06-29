@@ -20,6 +20,7 @@
     "test:e2e": "jest --config ./test/jest-e2e.json"
   },
   "dependencies": {
+    "@langchain/community": "^1.1.29",
     "@langchain/core": "^1.1.48",
     "@langchain/groq": "^1.2.1",
     "@langchain/langgraph": "^1.4.1",
@@ -27,9 +28,11 @@
     "@nestjs/config": "^4.0.4",
     "@nestjs/core": "^11.0.1",
     "@nestjs/platform-express": "^11.0.1",
+    "@tavily/core": "^0.7.6",
     "axios": "^1.17.0",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.15.1",
+    "duck-duck-scrape": "^2.2.7",
     "langchain": "^1.4.4",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1"

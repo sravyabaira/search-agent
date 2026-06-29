@@ -128,11 +128,47 @@ describe('ChatService', () => {
 
     expect(systemMessage).toBeDefined();
     expect(systemMessage.content).toContain(
-      'Base your answers ONLY on data from tool results.',
+      'Base your answers ONLY on data from tool results in the conversation.',
     );
     expect(systemMessage.content).toContain(
       'Never use your pre-trained knowledge to answer questions about users.',
     );
+  });
+
+  it('answers follow-up questions from previous search results without calling the tool again', async () => {
+    mockInvoke
+      .mockResolvedValueOnce(
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              name: 'user_search',
+              args: { query: 'sravya' },
+              id: 'call_1',
+              type: 'tool_call',
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(
+        new AIMessage('Found user sravya with pet: Fluffy'),
+      )
+      .mockResolvedValueOnce(new AIMessage('The pet name is Fluffy.'));
+
+    await service.chat({
+      messages: [{ role: 'user', content: 'search sravya' }],
+    });
+
+    mockInvoke.mockClear();
+    mockedAxios.get.mockClear();
+
+    const result = await service.chat({
+      messages: [{ role: 'user', content: 'what is the pet name?' }],
+    });
+
+    expect(mockedAxios.get).not.toHaveBeenCalled();
+    expect(mockInvoke).toHaveBeenCalledTimes(1);
+    expect(result.message.content).toBe('The pet name is Fluffy.');
   });
 });
 

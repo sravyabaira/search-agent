@@ -50,6 +50,27 @@ const userSearchTool = tool(
   }
 );
 
+const calculationTool = tool(
+  async ({ expression }) => {
+    try {
+      const result = Function(`"use strict"; return (${expression})`)();
+      return `${expression} = ${result}`;
+    } catch (error) {
+      return `Error calculating: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  },
+  {
+    name: 'calculation_tool',
+    description: 'Evaluates a math expression and returns the result.',
+    schema: z.object({
+      expression: z.string().describe('A math expression to evaluate, e.g. "2 + 2" or "10 * 5 / 2"'),
+    }),
+  },
+);
+
+const tools = [userSearchTool, calculationTool];
+const toolNode = new ToolNode(tools);
+
 const GraphState = Annotation.Root({
   messages: Annotation<BaseMessage[]>({
     reducer: (x, y) => x.concat(y),
@@ -69,12 +90,11 @@ export class ChatService {
 
   constructor(private readonly configService: ConfigService) {
     this.defaultModel =
-      this.configService.get<string>('GROQ_MODEL') ?? 'llama-3.3-70b-versatile';
+      this.configService.get<string>('GROQ_MODEL') ?? 'llama-3.1-8b-instant';
     this.app = this.initializeGraph();
   }
 
   private initializeGraph() {
-    const toolNode = new ToolNode([userSearchTool]);
 
     const shouldContinue = (state: typeof GraphState.State) => {
       const lastMessage = state.messages.at(-1);
@@ -94,7 +114,7 @@ export class ChatService {
         const llm = this.createModel(state.model || this.defaultModel);
         const lastMessage = state.messages.at(-1);
         const hasToolMessage = lastMessage instanceof ToolMessage;
-        const llmWithTools = hasToolMessage ? llm : llm.bindTools([userSearchTool]);
+        const llmWithTools = hasToolMessage ? llm : llm.bindTools(tools);
 
         const systemPrompt = `You are a helpful assistant that searches for user information.
 
@@ -116,8 +136,25 @@ export class ChatService {
         const response = await llmWithTools.invoke(messages);
         return { messages: [response] };
       })
+      .addNode('weatherNode', async (state) => {
+        const lastMsg = state.messages.at(-1);
+        const content = lastMsg?.content as string;
+
+        // Has to guess — no city in "search for sravya"
+        const cityMatch = content.match(/weather in (\w+)/i);
+        if (!cityMatch) {
+          console.log('[Weather] No city found, skipping');
+          return {}; // exits silently
+        }
+
+        const city = cityMatch[1];
+        // fetch weather...
+        return { messages: [new AIMessage(`Weather in ${city}: 28°C`)] };
+      })
+
       .addNode('tools', toolNode)
       .addEdge(START, 'agent')
+      .addEdge(START, 'weatherNode')
       .addConditionalEdges('agent', shouldContinue)
       .addEdge('tools', 'agent');
 
@@ -160,6 +197,7 @@ export class ChatService {
 
     const newlyAddedMessages = resultState.messages.slice(history.length);
     this.histories.set('default', [...history, ...newlyAddedMessages]);
+
     return {
       model,
       message: {
